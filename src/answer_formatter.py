@@ -37,6 +37,46 @@ def format_count(result: dict) -> str:
     return f"**{result['count']} vendors** matching: _{summary}_."
 
 
+def _vendor_card(r: pd.Series) -> str:
+    """Render a single vendor as a markdown blockquote card."""
+    name = r.get("Vendor_Name", "?")
+    city = r.get("City", "")
+    state = r.get("State", "")
+    work_type = r.get("Work_Type", "")
+    rating = r.get("Quality_Rating", "")
+    score = r.get("overall_score", "")
+    rec = _rec_badge(r.get("Recommendation", ""))
+    contact = r.get("Primary_Contact", "")
+
+    title = f"> ### {name}"
+    if rec:
+        title += f"  {rec}"
+
+    lines = [title]
+
+    location = ", ".join(p for p in [city, state] if p)
+    if location:
+        lines.append(f"> 📍 {location}")
+
+    work_bits = []
+    if work_type:
+        work_bits.append(f"🔧 {work_type}")
+    if rating:
+        work_bits.append(f"⭐ {rating}")
+    if score:
+        try:
+            work_bits.append(f"📊 {float(score):.2f}")
+        except (TypeError, ValueError):
+            pass
+    if work_bits:
+        lines.append("> " + "  ·  ".join(work_bits))
+
+    if contact:
+        lines.append(f"> 📞 {contact}")
+
+    return "\n".join(lines)
+
+
 def format_list(result: dict, max_rows: int = 50) -> str:
     rows = result["rows"]
     summary = _filter_summary(result["applied_filters"])
@@ -49,33 +89,8 @@ def format_list(result: dict, max_rows: int = 50) -> str:
         header += f"\n_Showing first {max_rows} (of {len(rows)}):_\n"
         rows = rows.head(max_rows)
 
-    lines = []
-    for _, r in rows.iterrows():
-        name = r.get("Vendor_Name", "?")
-        city = r.get("City", "")
-        state = r.get("State", "")
-        work_type = r.get("Work_Type", "")
-        rating = r.get("Quality_Rating", "")
-        rec = _rec_badge(r.get("Recommendation", ""))
-        contact = _contact_line(r)
-
-        loc = " · ".join(p for p in [city, state] if p)
-        meta_bits = []
-        if work_type:
-            meta_bits.append(f"🔧 {work_type}")
-        if rating:
-            meta_bits.append(f"⭐ {rating}")
-        if rec:
-            meta_bits.append(rec)
-
-        line = f"- **{name}** — {loc}"
-        if meta_bits:
-            line += f" ({', '.join(meta_bits)})"
-        if contact:
-            line += f"  \n  {contact}"
-        lines.append(line)
-
-    return header + "\n".join(lines)
+    cards = [_vendor_card(r) for _, r in rows.iterrows()]
+    return header + "\n\n".join(cards)
 
 
 def format_lookup(result: dict) -> str:

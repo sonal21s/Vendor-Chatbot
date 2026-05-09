@@ -42,10 +42,21 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
         if matched:
             applied["City"] = matched
 
-    if slots.get("work_type"):
-        filtered, matched = _fuzzy_filter(filtered, "Work_Type", slots["work_type"])
-        if matched:
-            applied["Work_Type"] = matched
+    if slots.get("work_type") and "Work_Type" in filtered.columns:
+        wt = slots["work_type"].strip().lower()
+        # Strip trailing filler words the LLM might leave on.
+        for suffix in (" work", " job", " service", " services", " task"):
+            if wt.endswith(suffix):
+                wt = wt[: -len(suffix)].strip()
+        # Lenient match: any cell whose lowered text contains the keyword,
+        # OR fuzzy-matches it via partial_ratio (handles light typos).
+        col = filtered["Work_Type"].str.lower()
+        contains_mask = col.str.contains(wt, na=False, regex=False)
+        fuzzy_mask = col.apply(
+            lambda v: bool(v) and fuzz.partial_ratio(wt, v) >= FUZZ_THRESHOLD
+        )
+        filtered = filtered[contains_mask | fuzzy_mask]
+        applied["Work_Type~"] = wt
 
     if slots.get("recommendation") and "Recommendation" in filtered.columns:
         tag = slots["recommendation"]
@@ -74,9 +85,25 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
             filtered = filtered[filtered["Vendor_Name"].isin(matched_names)]
             applied["Vendor_Name~"] = slots["vendor_name"]
 
+    # Rank best → worst by overall_score (NaN/missing pushed to the end).
+    if "overall_score" in filtered.columns and len(filtered) > 1:
+        scores = pd.to_numeric(filtered["overall_score"], errors="coerce")
+        filtered = filtered.assign(_sort=scores).sort_values(
+            "_sort", ascending=False, na_position="last"
+        ).drop(columns=["_sort"])
+
+    total_matches = len(filtered)
+
+    # Apply user-requested top-N limit AFTER sorting.
+    limit = slots.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        filtered = filtered.head(limit)
+        applied["limit"] = limit
+
     return {
         "rows": filtered,
         "count": len(filtered),
+        "total_matches": total_matches,
         "applied_filters": applied,
         "intent": slots.get("intent", "list"),
     }

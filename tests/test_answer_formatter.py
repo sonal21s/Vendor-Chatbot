@@ -41,6 +41,16 @@ def test_format_list_includes_work_type():
     assert "Plumbing" in out
 
 
+def test_format_list_includes_score():
+    df = pd.DataFrame([{
+        "Vendor_Name": "Acme", "City": "Mumbai", "State": "MH",
+        "Recommendation": "Recommended", "Primary_Contact": "1234",
+        "overall_score": "0.87",
+    }])
+    out = format_list(_result(df, {}))
+    assert "0.87" in out
+
+
 def test_format_list_risky_badge():
     df = pd.DataFrame([{
         "Vendor_Name": "RiskCo", "City": "X", "State": "Y",

@@ -18,8 +18,15 @@ Return ONLY valid JSON matching this schema:
   "vendor_name": string or null,
   "recommendation": "Recommended" | "Good" | "Risky" | null,
   "exclude_risky": true | false,
-  "min_rating": number or null
+  "min_rating": number or null,
+  "limit": integer or null
 }
+
+CRITICAL — handling conversation history:
+- Each user turn is treated as INDEPENDENT by default. Extract only what is explicitly stated in the CURRENT user message.
+- Do NOT inherit filters from earlier turns (e.g. earlier work_type, earlier recommendation tier) unless the current turn is clearly a referential follow-up.
+- A turn is a referential follow-up ONLY when it uses pronouns or refers back explicitly: "show me the recommended ones", "now filter by Mumbai", "and how many of those are risky?". In those cases, merge the prior filters with the new ones.
+- A turn that names a fresh subject ("list vendors from Andhra", "vendors in Pune") is a NEW query — discard prior work_type, recommendation, etc., even if recent turns mentioned them.
 
 Rules:
 - "intent" is "count" for "how many" questions, "list" for "list/show all", "lookup" for "tell me about X" or "details of X", "details" same as lookup.
@@ -33,12 +40,14 @@ Rules:
     * "delhi" / "new delhi" / "DL" → "Delhi"
   If the state is genuinely ambiguous (e.g. just "uttar" could be Uttar Pradesh or Uttarakhand), pick the most populous match.
 - For "city" and "vendor_name", preserve user spelling — do NOT correct typos. Fuzzy matching happens downstream.
-- "recommendation" maps user phrasing to one of three tags:
-    * "Recommended" — user asks for recommended/preferred/top/best vendors
-    * "Good" — user asks for good/decent/acceptable vendors
-    * "Risky" — user asks for risky/problematic vendors
-    * null — recommendation tier not mentioned
+- "recommendation" maps user phrasing to one of three explicit tier names:
+    * "Recommended" — user explicitly says "recommended" or "preferred" vendors
+    * "Good" — user explicitly says "good" / "decent" / "acceptable"
+    * "Risky" — user explicitly says "risky" / "problematic"
+    * null — tier not explicitly mentioned
+  IMPORTANT: words like "top", "best", "highest", "5 best" do NOT mean "Recommended". They mean "highest-scored" — the data is already sorted by score, so set recommendation = null and use the "limit" field instead.
 - "exclude_risky" is true if user explicitly wants to avoid risky vendors ("not risky", "avoid risky", "safe vendors"), false otherwise.
+- "limit" captures phrases like "top 5", "best 3", "show me 10", "first 7". Extract the integer. If the user says "top vendors" without a number, leave as null. If no limit phrasing, leave as null.
 - Set fields to null when not mentioned.
 - Output JSON only, no prose."""
 
@@ -64,4 +73,4 @@ def extract_slots(query: str, history: list[dict] | None = None) -> dict:
         return {"intent": "lookup", "state": None, "city": None,
                 "work_type": None, "vendor_name": None,
                 "recommendation": None, "exclude_risky": False,
-                "min_rating": None}
+                "min_rating": None, "limit": None}
