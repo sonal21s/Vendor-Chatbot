@@ -1,0 +1,11 @@
+.streamlit/secrets.toml
+.claude/
+data/
+credentials/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.env
+.pytest_cache/
