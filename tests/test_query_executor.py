@@ -96,6 +96,40 @@ def test_min_rating():
     assert result["count"] == 2
 
 
+def test_parse_travel_km_handles_real_shapes():
+    from src.query_executor import parse_travel_km
+    import math
+    assert parse_travel_km("Upto 250 km") == 250
+    assert parse_travel_km("Local city within 50 km") == 50
+    assert parse_travel_km("25 kilometres") == 25
+    assert parse_travel_km("Anywhere in the country") == 9999
+    assert parse_travel_km("Pan India") == 9999
+    assert math.isnan(parse_travel_km(""))
+    assert math.isnan(parse_travel_km("Local"))
+
+
+def test_min_travel_km_filter_with_text_values():
+    df = pd.DataFrame([
+        {"Vendor_Name": "Near",      "City": "Mumbai", "Travel_Radius_KM": "Local city within 10 km"},
+        {"Vendor_Name": "Mid",       "City": "Mumbai", "Travel_Radius_KM": "Upto 40 km"},
+        {"Vendor_Name": "Far",       "City": "Mumbai", "Travel_Radius_KM": "100 kilometres"},
+        {"Vendor_Name": "Unlimited", "City": "Mumbai", "Travel_Radius_KM": "Anywhere in the country"},
+        {"Vendor_Name": "Empty",     "City": "Mumbai", "Travel_Radius_KM": ""},
+    ])
+    result = execute(df, {"intent": "list", "city": "Mumbai", "min_travel_km": 40})
+    names = set(result["rows"]["Vendor_Name"])
+    assert names == {"Mid", "Far", "Unlimited"}
+    assert "Near" not in names      # parsed 10 < 40
+    assert "Empty" not in names     # unparseable excluded
+
+
+def test_min_travel_km_no_op_when_column_missing():
+    df = pd.DataFrame([{"Vendor_Name": "A", "City": "Mumbai"}])
+    result = execute(df, {"intent": "list", "min_travel_km": 40})
+    # Column absent — filter should be a no-op, not crash or drop everything.
+    assert result["count"] == 1
+
+
 def test_results_sorted_best_to_worst_by_score():
     result = execute(_sample_df(), {"intent": "list"})
     names = list(result["rows"]["Vendor_Name"])
@@ -131,4 +165,113 @@ def test_sort_handles_missing_score():
     result = execute(df, {"intent": "list"})
     names = list(result["rows"]["Vendor_Name"])
     assert names[0] == "C"        # highest score first
-    assert names[-1] == "B"       # missing score last
+    # Empty score → tier "New / Never Used" (priority 2), Risky scores go last (priority 3).
+    # Here B has empty score (New tier), A=0.5 is Good. Order should be: C (Rec), A (Good), B (New)
+    assert names == ["C", "A", "B"]
+
+
+def test_tier_order_recommended_good_new_risky():
+    df = pd.DataFrame([
+        {"Vendor_Name": "Rec",   "overall_score": "0.90"},
+        {"Vendor_Name": "Risky", "overall_score": "0.30"},
+        {"Vendor_Name": "Good",  "overall_score": "0.60"},
+        {"Vendor_Name": "New",   "overall_score": "0"},
+    ])
+    result = execute(df, {"intent": "list"})
+    assert list(result["rows"]["Vendor_Name"]) == ["Rec", "Good", "New", "Risky"]
+
+
+def test_bank_columns_stripped_by_default():
+    df = pd.DataFrame([
+        {"Vendor_Name": "A", "Bank_Name": "HDFC", "Account_Number": "123", "IFSC": "HDFC0001"},
+    ])
+    result = execute(df, {"intent": "lookup", "vendor_name": "A"})
+    assert "Bank_Name" not in result["rows"].columns
+    assert "Account_Number" not in result["rows"].columns
+    assert "IFSC" not in result["rows"].columns
+    assert result["bank_included"] is False
+
+
+def test_bank_included_for_single_vendor_lookup():
+    df = pd.DataFrame([
+        {"Vendor_Name": "Arun Maurya", "Bank_Name": "HDFC", "Account_Number": "123"},
+    ])
+    result = execute(df, {
+        "intent": "lookup", "vendor_name": "Arun Maurya",
+        "requests_bank_details": True,
+    })
+    assert "Bank_Name" in result["rows"].columns
+    assert result["bank_included"] is True
+    assert result["bank_clarification_needed"] is False
+
+
+def test_bank_clarification_when_no_vendor_named():
+    df = pd.DataFrame([
+        {"Vendor_Name": "A", "Bank_Name": "HDFC"},
+        {"Vendor_Name": "B", "Bank_Name": "SBI"},
+    ])
+    result = execute(df, {
+        "intent": "list",  # not a lookup → can't expose bank
+        "requests_bank_details": True,
+    })
+    assert result["bank_included"] is False
+    assert result["bank_clarification_needed"] is True
+    assert "Bank_Name" not in result["rows"].columns
+
+
+def test_lookup_by_vendor_code():
+    df = pd.DataFrame([
+        {"Vendor_Name": "Arun Maurya",   "Vendor_Code": "ABCD-001"},
+        {"Vendor_Name": "Other Person",  "Vendor_Code": "XYZ-999"},
+    ])
+    result = execute(df, {"intent": "lookup", "vendor_code": "ABCD-001"})
+    assert result["count"] == 1
+    assert result["rows"].iloc[0]["Vendor_Name"] == "Arun Maurya"
+
+
+def test_lookup_by_vendor_code_case_insensitive():
+    df = pd.DataFrame([
+        {"Vendor_Name": "A", "Vendor_Code": "ArunJayprakaMumbaiVend"},
+    ])
+    result = execute(df, {"intent": "lookup", "vendor_code": "arunjayprakamumbaivend"})
+    assert result["count"] == 1
+
+
+def test_vendor_code_takes_precedence_over_name():
+    df = pd.DataFrame([
+        {"Vendor_Name": "Arun Maurya",  "Vendor_Code": "ABCD-001"},
+        {"Vendor_Name": "Arun Sharma",  "Vendor_Code": "XYZ-999"},
+    ])
+    # Both provided — code wins.
+    result = execute(df, {
+        "intent": "lookup", "vendor_name": "Arun Sharma", "vendor_code": "ABCD-001"
+    })
+    assert result["count"] == 1
+    assert result["rows"].iloc[0]["Vendor_Name"] == "Arun Maurya"
+
+
+def test_bank_included_when_looked_up_by_code():
+    df = pd.DataFrame([
+        {"Vendor_Name": "A", "Vendor_Code": "C1",
+         "Bank Account Number (Company)": "1234"},
+    ])
+    result = execute(df, {
+        "intent": "lookup", "vendor_code": "C1",
+        "requests_bank_details": True,
+    })
+    assert result["bank_included"] is True
+    assert "Bank Account Number (Company)" in result["rows"].columns
+
+
+def test_bank_clarification_when_lookup_returns_multiple():
+    df = pd.DataFrame([
+        {"Vendor_Name": "Arun Maurya",   "Bank_Name": "HDFC"},
+        {"Vendor_Name": "Arun Sharma",   "Bank_Name": "SBI"},
+    ])
+    result = execute(df, {
+        "intent": "lookup", "vendor_name": "Arun",
+        "requests_bank_details": True,
+    })
+    assert result["bank_clarification_needed"] is True
+    assert result["bank_included"] is False
+    assert "Bank_Name" not in result["rows"].columns

@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 from rapidfuzz import process, fuzz
 from settings import FUZZ_THRESHOLD
@@ -5,9 +6,60 @@ from src.utils import get_logger
 
 log = get_logger(__name__)
 
+# Any column whose name (lower) contains one of these keywords is treated
+# as sensitive banking/payment data. Stripped from the response by default
+# and only included when the user explicitly asks for a specific vendor.
+_BANK_KEYWORDS = ("bank", "account", "ifsc", "upi", "branch")
+
+
+def _is_bank_column(col_name: str) -> bool:
+    lower = str(col_name).lower()
+    return any(k in lower for k in _BANK_KEYWORDS)
+
+
+_UNLIMITED_KEYWORDS = ("anywhere", "country", "india", "unlimited", "pan ", "nation", "all of india", "any state")
+_UNLIMITED_KM = 9999.0
+
+
+def parse_travel_km(value) -> float:
+    """Convert a free-text Travel_Radius_KM cell into kilometres.
+
+    Handles the shapes vendors actually enter:
+        "Upto 250 km"             → 250
+        "Local city within 50 km" → 50
+        "25 kilometres"           → 25
+        "Anywhere in the country" → 9999 (treated as effectively unlimited)
+        ""  / "Local"             → NaN  (no extractable number)
+    Strategy: keyword-check for unlimited phrasing first, otherwise pick the
+    first integer/decimal in the string. Conservative when the text contains
+    a range like "30 to 50 km" — picks the lower bound.
+    """
+    if value is None:
+        return float("nan")
+    text = str(value).strip().lower()
+    if not text:
+        return float("nan")
+    if any(k in text for k in _UNLIMITED_KEYWORDS):
+        return _UNLIMITED_KM
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if match:
+        return float(match.group())
+    return float("nan")
+
+
+def _tier_priority(score) -> int:
+    """Order tiers: Recommended → Good → New/Never Used → Risky."""
+    s = pd.to_numeric(score, errors="coerce")
+    if pd.isna(s) or s == 0:
+        return 2          # New / Never Used (no track record)
+    if s >= 0.8:
+        return 0          # Recommended
+    if s >= 0.5:
+        return 1          # Good
+    return 3              # Risky (known issues)
+
 
 def _fuzzy_match_value(query_value: str, candidates: list[str]) -> str | None:
-    """Return the best-matching canonical value from candidates, or None."""
     if not query_value or not candidates:
         return None
     unique = list({c for c in candidates if c})
@@ -18,12 +70,11 @@ def _fuzzy_match_value(query_value: str, candidates: list[str]) -> str | None:
 
 
 def _fuzzy_filter(df: pd.DataFrame, column: str, value: str) -> tuple[pd.DataFrame, str | None]:
-    """Filter df where column ≈ value (fuzzy). Returns (filtered_df, matched_value)."""
     if not value or column not in df.columns:
         return df, None
     matched = _fuzzy_match_value(value, df[column].tolist())
     if matched is None:
-        return df.iloc[0:0], None  # empty
+        return df.iloc[0:0], None
     return df[df[column].str.lower() == matched.lower()], matched
 
 
@@ -44,12 +95,9 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
 
     if slots.get("work_type") and "Work_Type" in filtered.columns:
         wt = slots["work_type"].strip().lower()
-        # Strip trailing filler words the LLM might leave on.
         for suffix in (" work", " job", " service", " services", " task"):
             if wt.endswith(suffix):
                 wt = wt[: -len(suffix)].strip()
-        # Lenient match: any cell whose lowered text contains the keyword,
-        # OR fuzzy-matches it via partial_ratio (handles light typos).
         col = filtered["Work_Type"].str.lower()
         contains_mask = col.str.contains(wt, na=False, regex=False)
         fuzzy_mask = col.apply(
@@ -72,8 +120,18 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
         filtered = filtered[ratings >= float(slots["min_rating"])]
         applied["min_rating"] = slots["min_rating"]
 
-    if slots.get("vendor_name"):
-        # Fuzzy match on vendor name — partial-match friendly
+    if slots.get("min_travel_km") is not None and "Travel_Radius_KM" in filtered.columns:
+        radii = filtered["Travel_Radius_KM"].apply(parse_travel_km)
+        filtered = filtered[radii >= float(slots["min_travel_km"])]
+        applied["min_travel_km"] = slots["min_travel_km"]
+
+    # Vendor code is more specific than name — apply it first. If a code
+    # is present, we don't also apply the name fuzzy match (would over-restrict).
+    if slots.get("vendor_code") and "Vendor_Code" in filtered.columns:
+        code = str(slots["vendor_code"]).strip()
+        filtered = filtered[filtered["Vendor_Code"].str.lower() == code.lower()]
+        applied["Vendor_Code"] = code
+    elif slots.get("vendor_name"):
         names = filtered["Vendor_Name"].tolist() if "Vendor_Name" in filtered.columns else []
         if names:
             matches = process.extract(
@@ -85,12 +143,16 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
             filtered = filtered[filtered["Vendor_Name"].isin(matched_names)]
             applied["Vendor_Name~"] = slots["vendor_name"]
 
-    # Rank best → worst by overall_score (NaN/missing pushed to the end).
+    # Rank by tier-then-score: Recommended → Good → New/Never Used → Risky.
+    # Within each tier, sort by score descending.
     if "overall_score" in filtered.columns and len(filtered) > 1:
         scores = pd.to_numeric(filtered["overall_score"], errors="coerce")
-        filtered = filtered.assign(_sort=scores).sort_values(
-            "_sort", ascending=False, na_position="last"
-        ).drop(columns=["_sort"])
+        priorities = scores.apply(_tier_priority)
+        filtered = (
+            filtered.assign(_pri=priorities, _score=scores)
+            .sort_values(["_pri", "_score"], ascending=[True, False], na_position="last")
+            .drop(columns=["_pri", "_score"])
+        )
 
     total_matches = len(filtered)
 
@@ -100,10 +162,36 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
         filtered = filtered.head(limit)
         applied["limit"] = limit
 
+    # ------------------------------------------------------------------
+    # Bank-detail gating. The LLM NEVER sees bank columns unless we
+    # explicitly include them here, and we only include them when:
+    #   (a) the user explicitly asked for bank details, AND
+    #   (b) the result is unambiguously a single specific vendor.
+    # Otherwise: strip bank columns and signal that clarification is
+    # needed so the response generator can ask the user to specify.
+    # ------------------------------------------------------------------
+    bank_columns = [c for c in filtered.columns if _is_bank_column(c)]
+    bank_included = False
+    bank_clarification_needed = False
+    intent = slots.get("intent", "list")
+
+    if slots.get("requests_bank_details"):
+        # Allowed only for single-vendor lookups.
+        is_single_vendor = intent in ("lookup", "details") and len(filtered) == 1
+        if is_single_vendor:
+            bank_included = True  # keep bank columns visible
+        else:
+            bank_clarification_needed = True
+
+    if not bank_included and bank_columns:
+        filtered = filtered.drop(columns=bank_columns, errors="ignore")
+
     return {
         "rows": filtered,
         "count": len(filtered),
         "total_matches": total_matches,
         "applied_filters": applied,
-        "intent": slots.get("intent", "list"),
+        "intent": intent,
+        "bank_included": bank_included,
+        "bank_clarification_needed": bank_clarification_needed,
     }
