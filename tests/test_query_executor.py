@@ -237,6 +237,37 @@ def test_lookup_by_vendor_code_case_insensitive():
     assert result["count"] == 1
 
 
+def test_lookup_by_vendor_code_with_whitespace():
+    df = pd.DataFrame([
+        {"Vendor_Name": "Vijay Bilavn", "Vendor_Code": "  VIJAYBILAVN  "},  # padded
+    ])
+    result = execute(df, {"intent": "lookup", "vendor_code": "vijaybilavn"})
+    assert result["count"] == 1
+
+
+def test_vendor_name_case_insensitive():
+    df = pd.DataFrame([
+        {"Vendor_Name": "VIJAY RAJPUT", "Vendor_Code": "VR1"},
+        {"Vendor_Name": "Other Person", "Vendor_Code": "OP1"},
+    ])
+    # User types lowercase / mixed case; column has all caps
+    result = execute(df, {"intent": "lookup", "vendor_name": "vijay Rajput"})
+    assert result["count"] == 1
+    assert result["rows"].iloc[0]["Vendor_Name"] == "VIJAY RAJPUT"
+
+
+def test_name_slot_with_codelike_value_falls_back_to_code():
+    # LLM put 'VIJAYBILAVN' in vendor_name (no spaces). Executor should
+    # detect the code-like shape and fall back to Vendor_Code lookup.
+    df = pd.DataFrame([
+        {"Vendor_Name": "Vijay Bilavn", "Vendor_Code": "VIJAYBILAVN"},
+        {"Vendor_Name": "Some Other",   "Vendor_Code": "OTHER"},
+    ])
+    result = execute(df, {"intent": "lookup", "vendor_name": "VIJAYBILAVN"})
+    assert result["count"] == 1
+    assert result["rows"].iloc[0]["Vendor_Code"] == "VIJAYBILAVN"
+
+
 def test_vendor_code_takes_precedence_over_name():
     df = pd.DataFrame([
         {"Vendor_Name": "Arun Maurya",  "Vendor_Code": "ABCD-001"},

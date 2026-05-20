@@ -127,21 +127,50 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
 
     # Vendor code is more specific than name — apply it first. If a code
     # is present, we don't also apply the name fuzzy match (would over-restrict).
-    if slots.get("vendor_code") and "Vendor_Code" in filtered.columns:
-        code = str(slots["vendor_code"]).strip()
-        filtered = filtered[filtered["Vendor_Code"].str.lower() == code.lower()]
-        applied["Vendor_Code"] = code
-    elif slots.get("vendor_name"):
-        names = filtered["Vendor_Name"].tolist() if "Vendor_Name" in filtered.columns else []
-        if names:
-            matches = process.extract(
-                slots["vendor_name"], names,
-                scorer=fuzz.token_set_ratio,
-                score_cutoff=FUZZ_THRESHOLD, limit=10,
-            )
-            matched_names = [m[0] for m in matches]
-            filtered = filtered[filtered["Vendor_Name"].isin(matched_names)]
-            applied["Vendor_Name~"] = slots["vendor_name"]
+    code_value = slots.get("vendor_code")
+    name_value = slots.get("vendor_name")
+
+    if code_value and "Vendor_Code" in filtered.columns:
+        code = str(code_value).strip().lower()
+        col = filtered["Vendor_Code"].fillna("").astype(str).str.strip().str.lower()
+        filtered = filtered[col == code]
+        applied["Vendor_Code"] = code_value
+    elif name_value and "Vendor_Name" in filtered.columns:
+        query_norm = str(name_value).strip().lower()
+        # Build lower→original map so we can fuzz-match case-insensitively
+        # while still filtering against the original-cased column.
+        originals = filtered["Vendor_Name"].fillna("").astype(str).tolist()
+        lower_to_originals: dict[str, list[str]] = {}
+        for orig in originals:
+            lower_to_originals.setdefault(orig.strip().lower(), []).append(orig)
+
+        matches = process.extract(
+            query_norm,
+            list(lower_to_originals.keys()),
+            scorer=fuzz.token_set_ratio,
+            score_cutoff=FUZZ_THRESHOLD,
+            limit=10,
+        )
+        matched_originals: list[str] = []
+        for matched_lower, _, _ in matches:
+            matched_originals.extend(lower_to_originals[matched_lower])
+
+        # Fallback: if the user's "name" had no spaces (likely a code that
+        # the slot filler misclassified), also try exact code match.
+        if not matched_originals and " " not in str(name_value).strip() \
+                and "Vendor_Code" in filtered.columns:
+            code = str(name_value).strip().lower()
+            code_col = filtered["Vendor_Code"].fillna("").astype(str).str.strip().str.lower()
+            code_match = filtered[code_col == code]
+            if len(code_match) > 0:
+                filtered = code_match
+                applied["Vendor_Code"] = name_value
+            else:
+                filtered = filtered.iloc[0:0]
+                applied["Vendor_Name~"] = name_value
+        else:
+            filtered = filtered[filtered["Vendor_Name"].isin(matched_originals)]
+            applied["Vendor_Name~"] = name_value
 
     # Rank by tier-then-score: Recommended → Good → New/Never Used → Risky.
     # Within each tier, sort by score descending.

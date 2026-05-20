@@ -45,10 +45,15 @@ Rules:
   If the state is genuinely ambiguous (e.g. just "uttar" could be Uttar Pradesh or Uttarakhand), pick the most populous match.
 - For "city" and "vendor_name", preserve user spelling — do NOT correct typos. Fuzzy matching happens downstream.
 - "vendor_code" vs "vendor_name" — distinguish carefully:
-    * A vendor CODE is an identifier — typically camelCase or hyphenated alphanumeric with no spaces (e.g. "ArunJayprakaMumbaiVend", "ABCD-001", "VND_123"). When the user clearly references such an identifier ("code XYZ", "vendor code ABCD-001", or just pastes an identifier-looking token), put it in "vendor_code".
-    * A vendor NAME is a human name with spaces, capitalised words (e.g. "Arun Maurya", "Acme Pvt Ltd"). Put these in "vendor_name".
+    * A vendor CODE is a unique identifier with NO SPACES. It can be any of:
+        - camelCase: "ArunJayprakaMumbaiVend"
+        - ALL CAPS (with or without digits): "VIJAYBILAVN", "VND123", "ABCD"
+        - hyphenated / underscored: "ABCD-001", "VND_123"
+        - mixed alphanumeric: "Vnd001", "abc-2024"
+      If the user's token has NO whitespace and is being used as an identifier (e.g. "details of VIJAYBILAVN", "bank info for ABCD-001"), put it in "vendor_code".
+    * A vendor NAME has WHITESPACE between tokens (e.g. "Arun Maurya", "Acme Pvt Ltd", "Vijay Rajput"). Put these in "vendor_name".
     * If the user writes both ("Arun Maurya, code ABCD-001"), populate both fields. Downstream will prefer the code as the more specific identifier.
-    * If ambiguous, prefer "vendor_name".
+    * Rule of thumb: spaces → name; no spaces → code.
 - "recommendation" maps user phrasing to one of four explicit tier names:
     * "Recommended" — user explicitly says "recommended" or "preferred" vendors
     * "Good" — user explicitly says "good" / "decent" / "acceptable"
