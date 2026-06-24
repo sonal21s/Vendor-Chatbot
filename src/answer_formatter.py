@@ -88,6 +88,7 @@ def _vendor_block(r: pd.Series) -> str:
     state = r.get("State", "")
     work_type = r.get("Work_Type", "")
     rating = r.get("Quality_Rating", "")
+    cost = r.get("Cost_per_1000sqft", "")
     rec = _rec_label(r.get("Recommendation", ""))
     contact = r.get("Primary_Contact", "")
 
@@ -105,6 +106,8 @@ def _vendor_block(r: pd.Series) -> str:
         lines.append(f"- Work Type: {work_type}")
     if rating:
         lines.append(f"- Quality Rating: {rating}")
+    if cost:
+        lines.append(f"- Cost per 1000 sqft: {cost}")
     travel = r.get("Travel_Radius_KM", "")
     if travel:
         lines.append(f"- Travel Radius: {travel} km")

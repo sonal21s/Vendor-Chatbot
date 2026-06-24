@@ -124,6 +124,8 @@ def render_vendor_card(row: dict, expanded: bool = False, key_suffix: str = ""):
             st.markdown(f"**Work Type:** {row['Work_Type']}")
         if row.get("Quality_Rating"):
             st.markdown(f"**Quality Rating:** {row['Quality_Rating']}")
+        if row.get("Cost_per_1000sqft"):
+            st.markdown(f"**Cost per 1000 sqft:** {row['Cost_per_1000sqft']}")
         if row.get("Travel_Radius_KM"):
             st.markdown(f"**Travel Radius:** {row['Travel_Radius_KM']} km")
         if row.get("Primary_Contact"):
