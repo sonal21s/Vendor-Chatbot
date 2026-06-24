@@ -14,3 +14,9 @@ def get_logger(name: str) -> logging.Logger:
 def cached_dataframe():
     from src.ingest import load_vendors_df
     return load_vendors_df()
+
+
+@st.cache_resource(show_spinner="Loading city coordinates…")
+def cached_city_coords():
+    from src.ingest import load_city_coords
+    return load_city_coords()

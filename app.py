@@ -1,5 +1,5 @@
 import streamlit as st
-from src.utils import cached_dataframe
+from src.utils import cached_dataframe, cached_city_coords
 from src.slot_filler import extract_slots
 from src.query_executor import execute
 from src.response_generator import generate_response
@@ -42,6 +42,7 @@ check_password()
 st.title("Vendor Assistant")
 
 df = cached_dataframe()
+city_coords = cached_city_coords()
 
 
 # ---------- card rendering --------------------------------------------------
@@ -177,6 +178,7 @@ with st.sidebar:
         st.metric("States covered", df["State"].nunique())
     if st.button("Reload data from sheet"):
         cached_dataframe.clear()
+        cached_city_coords.clear()
         st.rerun()
     st.divider()
     if st.button("Clear chat history"):
@@ -213,7 +215,7 @@ if prompt := st.chat_input("Ask about vendors…"):
 
         with st.spinner("Parsing query…"):
             slots = extract_slots(prompt, history=history_for_llm)
-            result = execute(df, slots)
+            result = execute(df, slots, city_coords)
         with st.spinner("Composing answer…"):
             intro = generate_response(prompt, result, history=history_for_llm)
 

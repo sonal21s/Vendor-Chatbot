@@ -1,4 +1,5 @@
 import re
+import math
 import pandas as pd
 from rapidfuzz import process, fuzz
 from settings import FUZZ_THRESHOLD
@@ -78,20 +79,74 @@ def _fuzzy_filter(df: pd.DataFrame, column: str, value: str) -> tuple[pd.DataFra
     return df[df[column].str.lower() == matched.lower()], matched
 
 
-def execute(df: pd.DataFrame, slots: dict) -> dict:
-    """Apply slot filters to df. Returns dict with filtered rows + applied filters."""
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points in kilometres."""
+    radius = 6371.0  # mean Earth radius, km
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def _nearest_city_with_vendors(
+    requested_city: str,
+    candidate_df: pd.DataFrame,
+    city_coords: dict,
+) -> tuple[str | None, float | None]:
+    """Find the closest city (by great-circle distance) that has vendors in
+    `candidate_df`. Returns (city_name, distance_km), or (None, None) when no
+    usable coordinates exist for the requested city or any candidate city.
+
+    `candidate_df` is expected to already have every NON-city filter applied,
+    so the nearest match still respects state / work_type / rating, etc.
+    Ties are broken alphabetically for deterministic results.
+    """
+    if not city_coords or "City" not in candidate_df.columns or candidate_df.empty:
+        return None, None
+    origin = city_coords.get(str(requested_city).strip().lower())
+    if origin is None:
+        return None, None  # we don't know where the requested city is
+
+    best_city: str | None = None
+    best_dist: float | None = None
+    seen: set[str] = set()
+    for city in candidate_df["City"]:
+        key = str(city).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        coords = city_coords.get(key)
+        if coords is None:
+            continue
+        dist = _haversine_km(origin[0], origin[1], coords[0], coords[1])
+        if (
+            best_dist is None
+            or dist < best_dist
+            or (dist == best_dist and key < str(best_city).strip().lower())
+        ):
+            best_city, best_dist = city, dist
+    return best_city, best_dist
+
+
+def execute(df: pd.DataFrame, slots: dict, city_coords: dict | None = None) -> dict:
+    """Apply slot filters to df. Returns dict with filtered rows + applied filters.
+
+    `city_coords` is an optional {city_lower: (lat, lon)} map. When a requested
+    city has no matching vendors, it powers a nearest-city fallback (substitute
+    the geographically closest city that does have matching vendors).
+    """
     filtered = df.copy()
     applied = {}
+    intent = slots.get("intent", "list")
+    city_coords = city_coords or {}
+    city_fallback = False
+    fallback_info = None
 
     if slots.get("state"):
         filtered, matched = _fuzzy_filter(filtered, "State", slots["state"])
         if matched:
             applied["State"] = matched
-
-    if slots.get("city"):
-        filtered, matched = _fuzzy_filter(filtered, "City", slots["city"])
-        if matched:
-            applied["City"] = matched
 
     if slots.get("work_type") and "Work_Type" in filtered.columns:
         wt = slots["work_type"].strip().lower()
@@ -124,6 +179,37 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
         radii = filtered["Travel_Radius_KM"].apply(parse_travel_km)
         filtered = filtered[radii >= float(slots["min_travel_km"])]
         applied["min_travel_km"] = slots["min_travel_km"]
+
+    # City is applied AFTER the other scalar filters so the nearest-city
+    # fallback (below) searches only among vendors that already satisfy
+    # state / work_type / rating / etc.
+    if slots.get("city"):
+        pre_city = filtered
+        filtered, matched = _fuzzy_filter(filtered, "City", slots["city"])
+        if matched:
+            applied["City"] = matched
+        elif (
+            intent in ("list", "lookup", "details")
+            and not slots.get("vendor_code")
+            and not slots.get("vendor_name")
+        ):
+            # No vendor in the requested city — substitute the nearest city
+            # that does have a matching vendor, if we can locate one.
+            nearest_city, dist = _nearest_city_with_vendors(
+                slots["city"], pre_city, city_coords
+            )
+            if nearest_city is not None:
+                filtered = pre_city[
+                    pre_city["City"].str.strip().str.lower()
+                    == str(nearest_city).strip().lower()
+                ]
+                city_fallback = True
+                fallback_info = {
+                    "requested": slots["city"],
+                    "nearest": nearest_city,
+                    "distance_km": round(dist, 1),
+                }
+                applied["City_fallback"] = fallback_info
 
     # Vendor code is more specific than name — apply it first. If a code
     # is present, we don't also apply the name fuzzy match (would over-restrict).
@@ -202,7 +288,6 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
     bank_columns = [c for c in filtered.columns if _is_bank_column(c)]
     bank_included = False
     bank_clarification_needed = False
-    intent = slots.get("intent", "list")
 
     if slots.get("requests_bank_details"):
         # Allowed only for single-vendor lookups.
@@ -223,4 +308,6 @@ def execute(df: pd.DataFrame, slots: dict) -> dict:
         "intent": intent,
         "bank_included": bank_included,
         "bank_clarification_needed": bank_clarification_needed,
+        "city_fallback": city_fallback,
+        "fallback_info": fallback_info,
     }
