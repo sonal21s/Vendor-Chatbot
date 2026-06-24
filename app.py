@@ -2,6 +2,7 @@ import streamlit as st
 from src.utils import cached_dataframe, cached_city_coords
 from src.slot_filler import extract_slots
 from src.query_executor import execute
+from src.geocode import geocode_city
 from src.response_generator import generate_response
 
 st.set_page_config(page_title="Vendor Assistant", page_icon="🏪", layout="centered")
@@ -215,7 +216,7 @@ if prompt := st.chat_input("Ask about vendors…"):
 
         with st.spinner("Parsing query…"):
             slots = extract_slots(prompt, history=history_for_llm)
-            result = execute(df, slots, city_coords)
+            result = execute(df, slots, city_coords, geocoder=geocode_city)
         with st.spinner("Composing answer…"):
             intro = generate_response(prompt, result, history=history_for_llm)
 

@@ -373,6 +373,53 @@ def test_count_intent_does_not_fall_back():
     assert result["count"] == 0
 
 
+# ---------- geocoded fallback (city absent from the CityCoord sheet) --------
+
+def _stub_geocoder(mapping):
+    """Fake geocoder: resolves on the leading place token, None otherwise."""
+    def _geocode(place):
+        key = str(place).split(",")[0].strip().lower()
+        return mapping.get(key)
+    return _geocode
+
+
+def test_geocoded_fallback_when_city_absent_from_coords():
+    # Khopoli has no vendors AND no CityCoord row. The injected geocoder
+    # resolves its coordinates, so the fallback can still find the nearest
+    # vendor city (Mumbai or Pune, both ~60 km away).
+    geocoder = _stub_geocoder({"khopoli": (18.7857, 73.3434)})
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Khopoli"}, _COORDS,
+        geocoder=geocoder,
+    )
+    assert result["city_fallback"] is True
+    assert result["fallback_info"]["requested"] == "Khopoli"
+    assert result["rows"].iloc[0]["City"] in {"Mumbai", "Pune"}
+
+
+def test_no_fallback_when_geocoder_returns_none():
+    # Geocoder can't resolve the city → behaves like 'not found', empty result.
+    geocoder = _stub_geocoder({})  # resolves nothing
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Nowhereville"}, _COORDS,
+        geocoder=geocoder,
+    )
+    assert result["city_fallback"] is False
+    assert result["count"] == 0
+
+
+def test_sheet_coords_take_precedence_over_geocoder():
+    # Thane IS in the sheet, so the geocoder must never be consulted.
+    def _boom(place):
+        raise AssertionError("geocoder must not be called when city is in the sheet")
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Thane"}, _COORDS,
+        geocoder=_boom,
+    )
+    assert result["city_fallback"] is True
+    assert result["rows"].iloc[0]["City"] == "Mumbai"
+
+
 def test_bank_clarification_when_lookup_returns_multiple():
     df = pd.DataFrame([
         {"Vendor_Name": "Arun Maurya",   "Bank_Name": "HDFC"},

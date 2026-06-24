@@ -1,6 +1,6 @@
 # Vendor Chatbot — Architecture
 
-A natural-language interface over a vendor database stored in Google Sheets. A service-procurement team asks questions in plain English ("how many recommended vendors in Pune?", "bank details for Vijay Rajput", "top 5 willing to travel 50km from Mumbai") and gets exact, structured answers with contact info. When a requested city has no vendors, it automatically falls back to the geographically nearest city that does.
+A natural-language interface over a vendor database stored in Google Sheets. A service-procurement team asks questions in plain English ("how many recommended vendors in Pune?", "bank details for Vijay Rajput", "top 5 willing to travel 50km from Mumbai") and gets exact, structured answers with contact info. When a requested city has no vendors, it automatically falls back to the geographically nearest city that does — geocoding the searched city on the fly if it isn't already a known vendor location.
 
 ## Design philosophy
 
@@ -43,14 +43,15 @@ This means counts are always correct (no top-k truncation), typos are handled pr
                                    │
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ src/query_executor.py · execute(df, slots, city_coords)             │
+│ src/query_executor.py · execute(df, slots, city_coords, geocoder)   │
 │ Pure pandas + rapidfuzz. No LLM calls.                               │
 │ • Fuzzy match State/City/Work_Type (rapidfuzz WRatio ≥ 80)           │
 │ • Exact case-insensitive match on Vendor_Code                        │
 │ • Case-insensitive token-set match on Vendor_Name                    │
 │ • Numeric filters: min_rating, min_travel_km                         │
 │ • NEAREST-CITY FALLBACK: if the requested city has no matching       │
-│   vendors, substitute the closest city that does (haversine)         │
+│   vendors, resolve its coords (sheet → geocoder) and substitute      │
+│   the closest vendor city that does (haversine)                      │
 │ • Tier-aware sort: Recommended → Good → New/Never → Risky            │
 │ • Top-N limit applied after sort                                     │
 │ • BANK GATE: strip bank columns unless requests_bank_details=True    │
@@ -98,9 +99,10 @@ Vendorchatbot/
 │
 ├── src/
 │   ├── __init__.py
-│   ├── ingest.py                  Google Sheets → pandas DataFrame
+│   ├── ingest.py                  Google Sheets → pandas DataFrame (+ city coords)
 │   ├── slot_filler.py             LLM call #1 — query → structured filters
 │   ├── query_executor.py          pandas + rapidfuzz filtering + bank gate
+│   ├── geocode.py                 Nominatim lookup for the nearest-city fallback
 │   ├── response_generator.py      LLM call #2 — result → intro sentence
 │   ├── answer_formatter.py        Deterministic formatter (fallback only)
 │   └── utils.py                   Logger + Streamlit caching helpers
@@ -207,9 +209,9 @@ The most-tested module. All filtering, counting, sorting, and the bank-detail ga
 | `_fuzzy_match_value(query, candidates)` | Picks the single best-matching canonical value using `rapidfuzz.process.extractOne` with `fuzz.WRatio` and the configured cutoff. Returns `None` if nothing scores high enough. |
 | `_fuzzy_filter(df, column, value)` | Applies `_fuzzy_match_value` against a column and returns `(filtered_df, matched_value)`. Used for State and City. |
 | `_haversine_km(lat1, lon1, lat2, lon2)` | Great-circle distance between two lat/lon points in kilometres. Pure math, no dependency. |
-| `_nearest_city_with_vendors(requested_city, candidate_df, city_coords)` | Returns `(city_name, distance_km)` for the closest city (by haversine) that has vendors in `candidate_df`, or `(None, None)` when the requested city or all candidates lack coordinates. `candidate_df` already has every non-city filter applied, so the match still respects state/work_type/rating. Ties break alphabetically for determinism. |
+| `_nearest_city_with_vendors(origin, candidate_df, city_coords)` | Returns `(city_name, distance_km)` for the closest vendor city (by haversine) to a resolved `origin` lat/lon, or `(None, None)` when no candidate has coordinates. `candidate_df` already has every non-city filter applied, so the match still respects state/work_type/rating. Ties break alphabetically for determinism. |
 | `_is_bank_column(col_name)` | Returns `True` if the column name contains a bank-related keyword. |
-| `execute(df, slots, city_coords=None)` | Main entry. Applies filters in order: State → Work_Type → Recommendation → exclude_risky → min_rating → min_travel_km → City (+ nearest-city fallback) → Vendor_Code / Vendor_Name → tier-sort → top-N limit → bank gate. Returns a result dict. `city_coords` is an optional `{city_lower: (lat, lon)}` map; omitting it disables the fallback. |
+| `execute(df, slots, city_coords=None, geocoder=None)` | Main entry. Applies filters in order: State → Work_Type → Recommendation → exclude_risky → min_rating → min_travel_km → City (+ nearest-city fallback) → Vendor_Code / Vendor_Name → tier-sort → top-N limit → bank gate. Returns a result dict. `city_coords` is an optional `{city_lower: (lat, lon)}` map; `geocoder` is an optional `str -> (lat, lon) \| None` callable used to resolve a searched city that isn't in the sheet. Omitting either narrows or disables the fallback. |
 
 Key behaviours within `execute`:
 
@@ -217,7 +219,7 @@ Key behaviours within `execute`:
 - **Vendor name lookup** is case-insensitive via a `lower → originals` map: candidates are lowercased before `fuzz.token_set_ratio`, then results are mapped back to the original-cased names for the row filter. (rapidfuzz's `token_set_ratio` is case-sensitive by default — this is the fix.)
 - **Self-correcting fallback**: if `vendor_name` is set but contains no whitespace and the name fuzzy match returns nothing, the executor automatically retries the value as a `Vendor_Code`. This makes the system resilient to the LLM occasionally misclassifying a code as a name.
 - **Work_Type matching** is the most lenient — strips trailing filler words (`work`, `job`, `service`), then uses `str.contains` plus `partial_ratio` so multi-value cells like *"Interior Audit, Carpentry"* still match queries for "interior audit".
-- **Nearest-city fallback**: the City filter runs *after* the other scalar filters so its candidate pool already respects state/work_type/rating. If the requested city fuzzy-matches no vendor, `_nearest_city_with_vendors` substitutes the geographically closest city that does have a match, sets `city_fallback=True`, and records `applied_filters["City_fallback"] = {requested, nearest, distance_km}`. The fallback is gated: it only fires for `intent in (list, lookup, details)` (a zero `count` is a correct answer, so counts never substitute), never when a `vendor_code`/`vendor_name` is supplied, and never when the requested city or all candidate cities are absent from `city_coords` — in which case the result stays empty exactly as before. Coordinates come from the `CityCoord` worksheet via `load_city_coords`.
+- **Nearest-city fallback**: the City filter runs *after* the other scalar filters so its candidate pool already respects state/work_type/rating. If the requested city fuzzy-matches no vendor, the executor resolves that city's own coordinates — **sheet first** (`city_coords`), **then the injected `geocoder`** if it isn't a known vendor location — and passes the result to `_nearest_city_with_vendors`, which substitutes the geographically closest vendor city, sets `city_fallback=True`, and records `applied_filters["City_fallback"] = {requested, nearest, distance_km}`. The fallback is gated: it only fires for `intent in (list, lookup, details)` (a zero `count` is a correct answer, so counts never substitute), never when a `vendor_code`/`vendor_name` is supplied, and never when the requested city can't be located (no sheet row, no geocoder, or the geocoder returns `None`) or no candidate city has coordinates — in which case the result stays empty exactly as before. Candidate-city coordinates come from the `CityCoord` worksheet via `load_city_coords`; the searched city's coordinates come from there too, or from `geocode.geocode_city` as a fallback.
 - **Sort order** is tier-then-score-desc: Recommended first (highest scores within tier), then Good, then New/Never Used (untested), then Risky (known issues last).
 - **Bank-detail gate**: bank columns are kept in the result **only when** `requests_bank_details=True` **and** the intent is `lookup`/`details` **and** exactly one row remains. Otherwise bank columns are dropped from the DataFrame entirely, and `bank_clarification_needed=True` is set so the response generator can ask the user to specify which vendor. **The LLM never sees bank columns unless this gate explicitly passes them through.**
 
@@ -236,6 +238,16 @@ Result dict shape:
     "fallback_info":   dict | None,   # { requested, nearest, distance_km } when city_fallback
 }
 ```
+
+### `src/geocode.py` — runtime geocoding
+
+Resolves a searched city to coordinates when it has no vendors and therefore no `CityCoord` row. This is the network-bound half of the nearest-city fallback; it's a separate module (and injected into `execute` as a callable) so the executor itself stays free of I/O and remains deterministic in tests.
+
+| Function | Purpose |
+|---|---|
+| `geocode_city(place)` | Resolves a place name to `(lat, lon)` via OpenStreetMap's free Nominatim API. Appends `", India"` when no country is present to bias/disambiguate results, sends the required `User-Agent`, uses a 5 s timeout, and is wrapped in `functools.lru_cache` (512 entries) so a given city is looked up at most once per process. Returns `None` on any failure — network error, no result, or an unexpected payload — so callers treat a miss exactly like "city unknown" and degrade gracefully. |
+
+Only the fallback path calls this, so a normal query (city has vendors, or city is already in the sheet) never makes a network request.
 
 ### `src/response_generator.py` — LLM call #2
 
@@ -318,7 +330,7 @@ A second worksheet in the same spreadsheet (name configurable via `CITY_COORDS_S
 | `Latitude` | numeric | Haversine distance |
 | `Longitude` | numeric | Haversine distance |
 
-Maintenance note: a city only participates in the fallback if it has a row here with numeric coordinates. Cities missing from this sheet are silently skipped (the fallback no-ops for them), so the sheet should be topped up as new vendor cities appear.
+Maintenance note: this sheet holds **only cities where the company has vendors** — the candidate pool the fallback substitutes *from*. It is intentionally **not** a general gazetteer. When a user searches for a city with no vendors (and so no row here), the executor geocodes that searched city at runtime via `geocode.geocode_city` to obtain its coordinates, then measures distance to the vendor cities listed here. So you only top this sheet up as new *vendor* locations appear; arbitrary searched cities are handled automatically.
 
 ### Score → tag mapping
 
@@ -360,7 +372,11 @@ Three reasons:
 
 ### Why does the nearest-city fallback use a sheet instead of a coordinate file?
 
-The dataset has no lat/long, so "nearest" needs a coordinate source. Rather than commit a JSON/CSV asset to the repo, the coordinates live in a `CityCoord` worksheet alongside the vendor data. The team already owns and edits the sheet, so they can top up coordinates for new cities without a code change or redeploy. The loader (`load_city_coords`) and the executor's fallback are both intentionally tolerant of missing rows, so an out-of-date sheet degrades gracefully (the fallback just no-ops for unknown cities) instead of breaking. Distance is a plain haversine calculation — no geocoding service or vector index — keeping the executor deterministic and offline, consistent with the rest of the pipeline.
+The dataset has no lat/long, so "nearest" needs a coordinate source. Rather than commit a JSON/CSV asset to the repo, the **vendor-city** coordinates live in a `CityCoord` worksheet alongside the vendor data. The team already owns and edits the sheet, so they can top up coordinates for new vendor locations without a code change or redeploy. The loader (`load_city_coords`) and the executor's fallback are both intentionally tolerant of missing rows, so an out-of-date sheet degrades gracefully (the fallback just no-ops) instead of breaking. Distance is a plain haversine calculation — no vector index — keeping the executor's geometry deterministic and offline.
+
+### Why geocode the searched city at runtime?
+
+The `CityCoord` sheet is deliberately kept to vendor cities only, so a user can ask about a city the company has never served (e.g. "Khopoli vendors"). To find that city's nearest vendor location we need *its* coordinates, which aren't — and shouldn't be — in the sheet. So `geocode.geocode_city` resolves the searched city on demand via Nominatim. Two deliberate choices keep this from compromising the rest of the pipeline: (1) the geocoder is **injected into `execute` as a callable**, so the executor performs no network I/O itself and stays fully deterministic under test (tests pass a stub or `None`); and (2) resolution is **sheet-first** — a known vendor city never triggers a network call, and the geocoder only runs on the cold path where a searched city is unknown. Lookups are cached and fail closed to `None`, so a geocoding outage simply reverts to the prior "no vendor found" behaviour rather than erroring.
 
 ### Why a separate `vendor_code` slot?
 
@@ -408,6 +424,7 @@ Tuning knobs (in `settings.py`):
 - Top-N limit and total_matches preservation
 - `parse_travel_km` across the four real value shapes
 - Nearest-city fallback: haversine distance, substitution of the closest city, respecting other active filters, and the no-op cases (count intent, requested city absent from coords, no coord map supplied)
+- Geocoded fallback: an injected stub geocoder resolves a city absent from the sheet (driving the substitution), the no-op when the geocoder returns `None`, and sheet-coordinates taking precedence so the geocoder is never consulted for a known vendor city
 - Bank-detail gating: stripped by default, included only for single-vendor lookups, clarification flagged for ambiguous queries
 - Vendor code lookup: exact, case-insensitive, whitespace-padded
 - Vendor name lookup: case-insensitive across the LLM's varied casing

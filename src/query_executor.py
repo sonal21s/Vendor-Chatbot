@@ -90,13 +90,15 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _nearest_city_with_vendors(
-    requested_city: str,
+    origin: tuple[float, float],
     candidate_df: pd.DataFrame,
     city_coords: dict,
 ) -> tuple[str | None, float | None]:
-    """Find the closest city (by great-circle distance) that has vendors in
-    `candidate_df`. Returns (city_name, distance_km), or (None, None) when no
-    usable coordinates exist for the requested city or any candidate city.
+    """Find the closest vendor city to `origin` (a resolved lat/lon).
+
+    Searches the cities present in `candidate_df` whose coordinates are known
+    from `city_coords` (the CityCoord sheet — vendor cities only). Returns
+    (city_name, distance_km), or (None, None) when no candidate has coordinates.
 
     `candidate_df` is expected to already have every NON-city filter applied,
     so the nearest match still respects state / work_type / rating, etc.
@@ -104,9 +106,6 @@ def _nearest_city_with_vendors(
     """
     if not city_coords or "City" not in candidate_df.columns or candidate_df.empty:
         return None, None
-    origin = city_coords.get(str(requested_city).strip().lower())
-    if origin is None:
-        return None, None  # we don't know where the requested city is
 
     best_city: str | None = None
     best_dist: float | None = None
@@ -129,12 +128,24 @@ def _nearest_city_with_vendors(
     return best_city, best_dist
 
 
-def execute(df: pd.DataFrame, slots: dict, city_coords: dict | None = None) -> dict:
+def execute(
+    df: pd.DataFrame,
+    slots: dict,
+    city_coords: dict | None = None,
+    geocoder=None,
+) -> dict:
     """Apply slot filters to df. Returns dict with filtered rows + applied filters.
 
-    `city_coords` is an optional {city_lower: (lat, lon)} map. When a requested
-    city has no matching vendors, it powers a nearest-city fallback (substitute
-    the geographically closest city that does have matching vendors).
+    `city_coords` is an optional {city_lower: (lat, lon)} map (the CityCoord
+    sheet — vendor cities only). When a requested city has no matching vendors,
+    it powers a nearest-city fallback (substitute the geographically closest
+    city that does have matching vendors).
+
+    `geocoder` is an optional callable `str -> (lat, lon) | None`. It resolves
+    the requested city's coordinates when that city is NOT in `city_coords`
+    (i.e. has no vendors), enabling the fallback for arbitrary searched cities.
+    Injected as a dependency so the executor stays free of network I/O and the
+    fallback is deterministic in tests. When omitted, only `city_coords` is used.
     """
     filtered = df.copy()
     applied = {}
@@ -194,22 +205,31 @@ def execute(df: pd.DataFrame, slots: dict, city_coords: dict | None = None) -> d
             and not slots.get("vendor_name")
         ):
             # No vendor in the requested city — substitute the nearest city
-            # that does have a matching vendor, if we can locate one.
-            nearest_city, dist = _nearest_city_with_vendors(
-                slots["city"], pre_city, city_coords
-            )
-            if nearest_city is not None:
-                filtered = pre_city[
-                    pre_city["City"].str.strip().str.lower()
-                    == str(nearest_city).strip().lower()
-                ]
-                city_fallback = True
-                fallback_info = {
-                    "requested": slots["city"],
-                    "nearest": nearest_city,
-                    "distance_km": round(dist, 1),
-                }
-                applied["City_fallback"] = fallback_info
+            # that does have a matching vendor. First we need the requested
+            # city's own coordinates: prefer the sheet, else geocode it.
+            requested = slots["city"]
+            origin = city_coords.get(str(requested).strip().lower())
+            if origin is None and geocoder is not None:
+                # Bias the lookup with state context when we have it.
+                place = f"{requested}, {slots['state']}" if slots.get("state") else requested
+                origin = geocoder(place)
+
+            if origin is not None:
+                nearest_city, dist = _nearest_city_with_vendors(
+                    origin, pre_city, city_coords
+                )
+                if nearest_city is not None:
+                    filtered = pre_city[
+                        pre_city["City"].str.strip().str.lower()
+                        == str(nearest_city).strip().lower()
+                    ]
+                    city_fallback = True
+                    fallback_info = {
+                        "requested": requested,
+                        "nearest": nearest_city,
+                        "distance_km": round(dist, 1),
+                    }
+                    applied["City_fallback"] = fallback_info
 
     # Vendor code is more specific than name — apply it first. If a code
     # is present, we don't also apply the name fuzzy match (would over-restrict).
