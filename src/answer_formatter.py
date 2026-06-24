@@ -28,6 +28,11 @@ def _filter_summary(applied: dict) -> str:
     for k, v in applied.items():
         if k == "Vendor_Name~":
             parts.append(f"name like \"{v}\"")
+        elif k == "City_fallback":
+            parts.append(
+                f"no vendors in {v['requested']} — nearest: {v['nearest']} "
+                f"(~{v['distance_km']} km)"
+            )
         else:
             parts.append(f"{k}={v}")
     return ", ".join(parts)

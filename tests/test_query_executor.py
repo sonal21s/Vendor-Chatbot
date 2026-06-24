@@ -1,5 +1,5 @@
 import pandas as pd
-from src.query_executor import execute, _fuzzy_match_value
+from src.query_executor import execute, _fuzzy_match_value, _haversine_km
 
 
 def _sample_df():
@@ -292,6 +292,132 @@ def test_bank_included_when_looked_up_by_code():
     })
     assert result["bank_included"] is True
     assert "Bank Account Number (Company)" in result["rows"].columns
+
+
+# ---------- nearest-city fallback ------------------------------------------
+
+# Approximate coordinates for the cities used in _sample_df plus a few extras.
+_COORDS = {
+    "mumbai":    (19.0760, 72.8777),
+    "pune":      (18.5204, 73.8567),
+    "bangalore": (12.9716, 77.5946),
+    "nashik":    (19.9975, 73.7898),   # ~165 km from Pune, ~150 km from Mumbai
+    "thane":     (19.2183, 72.9781),   # ~20 km from Mumbai
+}
+
+
+def test_haversine_known_distance():
+    # Mumbai <-> Pune is roughly 120 km as the crow flies.
+    dist = _haversine_km(19.0760, 72.8777, 18.5204, 73.8567)
+    assert 110 < dist < 130
+
+
+def test_city_with_vendors_no_fallback():
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Mumbai"}, _COORDS
+    )
+    assert result["city_fallback"] is False
+    assert result["fallback_info"] is None
+    assert result["count"] == 1
+    assert result["rows"].iloc[0]["City"] == "Mumbai"
+
+
+def test_nearest_city_fallback_substitutes_closest():
+    # No vendor in Thane; nearest city with a vendor is Mumbai (~20 km).
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Thane"}, _COORDS
+    )
+    assert result["city_fallback"] is True
+    assert result["count"] == 1
+    assert result["rows"].iloc[0]["City"] == "Mumbai"
+    info = result["fallback_info"]
+    assert info["requested"] == "Thane"
+    assert info["nearest"] == "Mumbai"
+    assert result["applied_filters"]["City_fallback"] == info
+
+
+def test_fallback_respects_other_filters():
+    # Thane has no vendors. Constrain to Karnataka — the only candidate left is
+    # Bangalore, so the nearest (and only) fallback city must be Bangalore.
+    result = execute(
+        _sample_df(),
+        {"intent": "list", "city": "Thane", "state": "Karnataka"},
+        _COORDS,
+    )
+    assert result["city_fallback"] is True
+    assert result["rows"].iloc[0]["City"] == "Bangalore"
+
+
+def test_no_fallback_when_requested_city_not_in_coords():
+    # Requested city has no coordinates → cannot compute nearest → empty result.
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Atlantis"}, _COORDS
+    )
+    assert result["city_fallback"] is False
+    assert result["count"] == 0
+
+
+def test_no_fallback_without_coords():
+    # No coord map supplied → behaves exactly as before (empty on no match).
+    result = execute(_sample_df(), {"intent": "list", "city": "Thane"})
+    assert result["city_fallback"] is False
+    assert result["count"] == 0
+
+
+def test_count_intent_does_not_fall_back():
+    # "how many in Thane" → 0 is a correct answer; do not substitute a city.
+    result = execute(
+        _sample_df(), {"intent": "count", "city": "Thane"}, _COORDS
+    )
+    assert result["city_fallback"] is False
+    assert result["count"] == 0
+
+
+# ---------- geocoded fallback (city absent from the CityCoord sheet) --------
+
+def _stub_geocoder(mapping):
+    """Fake geocoder: resolves on the leading place token, None otherwise."""
+    def _geocode(place):
+        key = str(place).split(",")[0].strip().lower()
+        return mapping.get(key)
+    return _geocode
+
+
+def test_geocoded_fallback_when_city_absent_from_coords():
+    # Khopoli has no vendors AND no CityCoord row. The injected geocoder
+    # resolves its coordinates, so the fallback can still find the nearest
+    # vendor city (Mumbai or Pune, both ~60 km away).
+    geocoder = _stub_geocoder({"khopoli": (18.7857, 73.3434)})
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Khopoli"}, _COORDS,
+        geocoder=geocoder,
+    )
+    assert result["city_fallback"] is True
+    assert result["fallback_info"]["requested"] == "Khopoli"
+    assert result["rows"].iloc[0]["City"] in {"Mumbai", "Pune"}
+
+
+def test_no_fallback_when_geocoder_returns_none():
+    # Geocoder can't resolve the city → behaves like 'not found', empty result.
+    geocoder = _stub_geocoder({})  # resolves nothing
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Nowhereville"}, _COORDS,
+        geocoder=geocoder,
+    )
+    assert result["city_fallback"] is False
+    assert result["count"] == 0
+
+
+def test_sheet_coords_take_precedence_over_geocoder():
+    # Thane IS in the sheet, so the geocoder must never be consulted.
+    def _boom(place):
+        raise AssertionError("geocoder must not be called when city is in the sheet")
+    result = execute(
+        _sample_df(), {"intent": "list", "city": "Thane"}, _COORDS,
+        geocoder=_boom,
+    )
+    assert result["city_fallback"] is True
+    assert result["rows"].iloc[0]["City"] == "Mumbai"
 
 
 def test_bank_clarification_when_lookup_returns_multiple():

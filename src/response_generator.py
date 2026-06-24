@@ -28,6 +28,8 @@ A JSON payload:
 - truncated        : bool
 - vendors          : the matched rows (already sorted best→worst)
 - bank_clarification_needed : if true, the user asked for bank details but the vendor is not uniquely identified
+- city_fallback     : if true, the requested city had NO vendors and these results are from the nearest city instead
+- fallback_info     : when city_fallback is true, { requested, nearest, distance_km } describing the substitution
 
 OUTPUT RULES
 1. Write ONLY the intro. Do NOT render vendor cards, bullet lists, or per-vendor details. The UI handles that.
@@ -55,6 +57,12 @@ intent = "lookup" / "details"
 - If `count == 1`: a single short sentence acknowledging the match, e.g. "Here are the details for **<Vendor_Name>**."
 - If `count > 1`: "Found **N possible matches**, sorted best first."
 
+city_fallback = true
+- The requested city has NO vendors, so these results are from the NEAREST city instead. You MUST make this explicit so the user does not mistake them for an exact-city match.
+- Open by stating there are no vendors in `fallback_info.requested`, then say you are showing the nearest city `fallback_info.nearest` (~`fallback_info.distance_km` km away).
+  e.g. "No vendors in **Nashik**. Showing the nearest city, **Pune** (~165 km away): **4 vendors**, best first."
+- Apply this together with the intent rules above (it still describes the same list/count framing).
+
 bank_clarification_needed = true
 - This OVERRIDES the rules above. Your entire reply is a short polite request asking the user to specify the **exact vendor name or Vendor Code**. Do NOT show any vendor details. Do NOT include other content. Phrase example: "To share bank details I need the exact vendor name or Vendor Code. Which vendor are you asking about?" If `vendors` contains 2–10 candidate matches, you MAY list their names + Vendor Codes so the user can pick — but only the name and code, nothing else.
 
@@ -77,6 +85,8 @@ def _build_context(result: dict) -> dict:
         "applied_filters": result["applied_filters"],
         "truncated": truncated,
         "bank_clarification_needed": result.get("bank_clarification_needed", False),
+        "city_fallback": result.get("city_fallback", False),
+        "fallback_info": result.get("fallback_info"),
         "vendors": rows_for_llm,
     }
 
